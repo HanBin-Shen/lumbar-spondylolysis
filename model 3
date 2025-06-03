@@ -1,0 +1,348 @@
+import copy
+import time
+import os
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+import torch
+from torchvision.datasets import ImageFolder
+from torchvision import transforms
+import torch.utils.data as Data
+import numpy as np
+import matplotlib.pyplot as plt
+# from model import GoogLeNet, Inception
+import torch.nn as nn
+import pandas as pd
+import timm
+from timm.data.mixup import Mixup
+from torch.optim.swa_utils import AveragedModel, SWALR
+import albumentations as A # Augmentations
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import Dataset, DataLoader
+import os
+import glob
+from PIL import Image
+import torch
+import numpy as np
+import random
+import os
+
+
+def set_seed(seed):
+    # Python内置的random模块
+    random.seed(seed)
+    # numpy
+    np.random.seed(seed)
+    # PyTorch
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)  # 针对GPU
+    torch.cuda.manual_seed_all(seed)  # 针对多GPU
+
+    # 以下设置可保证计算的确定性，但可能会影响性能
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # 操作系统相关设置
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+set_seed(4)
+
+
+# 定义了训练数据和验证数据的数据增强操作
+train_aug = A.Compose([
+    # A.HorizontalFlip(p=0.2),
+    # A.VerticalFlip(p=0.5),
+    # A.Transpose(p=0.1),
+    # A.RandomRotate90(always_apply=False, p=0.1),
+    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10, p=0.3),  #0.5，对图像进行平移、缩放和旋转。增强操作的应用概率为 30%。
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),  # 随机调整亮度和对比度+-20。增强操作的应用概率为 50%。
+    # A.OneOf([
+    #     A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.2),
+    #     A.OpticalDistortion(distort_limit=0.05, shift_limit=0.05, p=0.2),
+    #     A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2)
+    # ], p=0.2),#0.2
+    # A.CoarseDropout(max_holes=8, max_height=224 // 20, max_width=224 // 20,
+    #                 min_holes=5, fill_value=0, mask_fill_value=0, p=0.1),
+
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], p=1.0),   #mean': (0.485, 0.456, 0.406), 'std': (0.229, 0.224, 0.225)
+    ToTensorV2(),
+])
+
+val_aug = A.Compose([
+    # A.Resize(448, 448,interpolation=cv2.INTER_NEAREST, p=1.0),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], p=1.0),#对图像进行标准化处理，使其符合模型预训练的输入分布。
+    ToTensorV2(),#将增强后的图像转换为 PyTorch 张量格式，便于模型处理。
+])
+
+
+
+
+class lwhdataset(Dataset):
+    def __init__(self, data_dir, train_transform, size, pad):
+        self.pad = pad
+        self.size = size
+        self.label_dict = {"0": 0, "1": 1}
+        self.data_dir = data_dir
+        # 获取文件路径列表
+        self.c_paths = sorted(glob.glob(os.path.join(data_dir, '*', '*')))
+        self.transforms = train_transform
+
+    def __getitem__(self, index):
+        label = self.label_dict[self.c_paths[index].split(os.sep)[-2]]
+        image = Image.open(self.c_paths[index]).convert("RGB")
+        if self.pad:
+            image = self.pading(self.size, image)
+            image = np.array(image)
+        else:
+            image = np.array(image)
+        image = self.transforms(image=image)['image']
+        return image, label
+
+    def __len__(self):
+        if len(self.c_paths) == 0:
+            raise Exception("\ndata_dir:{} is a empty dir! Please checkout your path to images!".format(self.data_dir))
+        return len(self.c_paths)
+
+    @staticmethod
+    def get_id_labels(data_dir):
+        image_fns = glob.glob(os.path.join(data_dir, '*'))
+        label_names = [os.path.split(s)[-1] for s in image_fns]
+        unique_labels = list(set(label_names))
+        unique_labels.sort()
+        id_labels = {_id: name for name, _id in enumerate(unique_labels)}
+        return id_labels
+
+    @staticmethod
+    def pading(size, img):
+        padding_v = tuple([125, 125, 125])
+        w, h = img.size
+        target_size = size
+        interpolation = Image.BILINEAR
+        if w &gt; h:
+            img = img.resize((int(target_size), int(h * target_size * 1.0 / w)), interpolation)
+        else:
+            img = img.resize((int(w * target_size * 1.0 / h), int(target_size)), interpolation)
+
+        ret_img = Image.new("RGB", (target_size, target_size), padding_v)
+        w, h = img.size
+        st_w = int((ret_img.size[0] - w) / 2.0)
+        st_h = int((ret_img.size[1] - h) / 2.0)
+        ret_img.paste(img, (st_w, st_h))
+        return ret_img
+
+
+
+
+def train_val_data_process():
+    ROOT_TRAIN = r"C:\Users\Administrator\Desktop\shb_model\model\data\train"
+    ROOT_VAL = r"C:\Users\Administrator\Desktop\shb_model\model\data\val"
+    #ROOT_TRAIN =r"C:\Users\Administrator\Desktop\zhen-model\model\data\cewei" +"/*/*" + "/*/*"
+    # ROOT_TRAIN = sorted(glob.glob(r"C:\Users\Administrator\Desktop\zhen-model\model\data\cewei" +"/*/*" + "/*/*"))
+    train_data = lwhdataset(data_dir=ROOT_TRAIN,  # lwhdataset 使用这些路径加载训练数据。train_path 是一个包含训练数据文件路径的列表。
+                            train_transform=train_aug,  # 数据增强方法，通过 train_aug 实现。
+                            size=224,  # 指定图像的目标尺寸，通常为一个整数值，用于统一训练过程中输入图像的大小（如 224、256）。
+                            pad=True)    # 用于决定是否在调整图像大小时进行填充（padding），以保持长宽比。
+    # val_data = lwhdataset(data_dir=ROOT_TRAIN, train_transform=val_aug, size= [224, 224], pad=True)
+    val_data = lwhdataset(data_dir=ROOT_VAL,  # lwhdataset 使用这些路径加载训练数据。train_path 是一个包含训练数据文件路径的列表。
+                            train_transform=val_aug,  # 数据增强方法，通过 train_aug 实现。
+                            size=224,  # 指定图像的目标尺寸，通常为一个整数值，用于统一训练过程中输入图像的大小（如 224、256）。
+                            pad=True)  # 用于决定是否在调整图像大小时进行填充（padding），以保持长宽比。
+
+
+
+
+    # normalize = transforms.Normalize([0.162, 0.151, 0.138], [0.058, 0.052, 0.048])
+    # # 定义数据集处理方法变量
+    # train_transform = transforms.Compose([transforms.Resize((224,224)), transforms.ToTensor(), normalize])
+    # # 加载数据集
+    # train_data = ImageFolder(ROOT_TRAIN, transform=train_transform)
+
+    #train_data, val_data = Data.random_split(train_data, [round(0.8*len(train_data)), round(0.2*len(train_data))])
+
+
+
+
+    train_dataloader = Data.DataLoader(dataset=train_data,
+                                       batch_size=8,
+                                       shuffle=True,
+                                       num_workers=2,
+                                       drop_last = True)
+
+    val_dataloader = Data.DataLoader(dataset=val_data,
+                                     batch_size=8,
+                                     shuffle=True,
+                                     num_workers=2,
+                                     drop_last = True)
+
+    return train_dataloader, val_dataloader
+
+
+
+def train_model_process(model, train_dataloader, val_dataloader, num_epochs):
+    # 设定训练所用到的设备，有GPU用GPU没有GPU用CPU
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 使用Adam优化器，学习率为0.001
+    #optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(),  # 获取模型的可训练参数，包括权重和偏置。这些参数将被 AdamW 优化。
+                                  lr=0.001,  # 学习率，控制优化器每次更新时的步长。
+                                  weight_decay=5e-2)  # 权重衰减参数，用于 L2 正则化，防止过拟合。
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer,  # 要调度学习率的优化器，通常是 torch.optim.AdamW 或其他优化器的实例。
+                                                       gamma=0.95)  # 指数衰减因子，控制学习率的下降速度。
+    # 损失函数为交叉熵函数
+    # x = [1.0, 1.0]  # x 是一个包含每个类别权重的列表或数组，例如 [0.1, 0.5, 1.0, 2.0]。这些权重用于对损失值进行加权，权重大则对应的类别对损失的贡献更大。
+    # weight = torch.Tensor(x).to("cuda:0")  # 将权重张量移动到 GPU（cuda:0）。如果模型和输入数据也在 GPU 上，权重张量必须一致在 GPU 上以避免运行时错误。
+    #criterion = torch.nn.CrossEntropyLoss(weight=weight)  # 用类权重定义损失函数
+    criterion = nn.CrossEntropyLoss()
+    # 将模型放入到训练设备中
+    model = model.to(device)
+    swa_model = AveragedModel(model)#它通过对模型权重的指数移动平均（EMA）或线性平均，来稳定模型的优化过程，提高泛化性能。
+    # 复制当前模型的参数
+    best_model_wts = copy.deepcopy(model.state_dict())
+
+    # 初始化参数
+    # 最高准确度
+    best_acc = 0.0
+    # 训练集损失列表
+    train_loss_all = []
+    # 验证集损失列表
+    val_loss_all = []
+    # 训练集准确度列表
+    train_acc_all = []
+    # 验证集准确度列表
+    val_acc_all = []
+    # 当前时间
+    since = time.time()
+
+    for epoch in range(num_epochs):
+        print("Epoch {}/{}".format(epoch, num_epochs-1))
+        print("-"*10)
+
+        # 初始化参数
+        # 训练集损失函数
+        train_loss = 0.0
+        # 训练集准确度
+        train_corrects = 0
+        # 验证集损失函数
+        val_loss = 0.0
+        # 验证集准确度
+        val_corrects = 0
+        # 训练集样本数量
+        train_num = 0
+        # 验证集样本数量
+        val_num = 0
+
+        # 对每一个mini-batch训练和计算
+        for step, (b_x, b_y) in enumerate(train_dataloader):
+            # 将特征放入到训练设备中
+            b_x = b_x.to(device)
+            # 将标签放入到训练设备中
+            b_y = b_y.to(device)
+            # 设置模型为训练模式
+            model.train()
+
+            # 前向传播过程，输入为一个batch，输出为一个batch中对应的预测
+            output = model(b_x)
+            # 查找每一行中最大值对应的行标
+            pre_lab = torch.argmax(output, dim=1)
+            # 计算每一个batch的损失函数
+            loss = criterion(output, b_y)
+
+            # 将梯度初始化为0
+            optimizer.zero_grad()
+            # 反向传播计算
+            loss.backward()
+            # 根据网络反向传播的梯度信息来更新网络的参数，以起到降低loss函数计算值的作用
+            optimizer.step()
+            # 对损失函数进行累加
+            train_loss += loss.item() * b_x.size(0)
+            # 如果预测正确，则准确度train_corrects加1
+            train_corrects += torch.sum(pre_lab == b_y.data)
+            # 当前用于训练的样本数量
+            train_num += b_x.size(0)
+        for step, (b_x, b_y) in enumerate(val_dataloader):
+            # 将特征放入到验证设备中
+            b_x = b_x.to(device)
+            # 将标签放入到验证设备中
+            b_y = b_y.to(device)
+            # 设置模型为评估模式
+            model.eval()
+            # 前向传播过程，输入为一个batch，输出为一个batch中对应的预测
+            output = model(b_x)
+            # 查找每一行中最大值对应的行标
+            pre_lab = torch.argmax(output, dim=1)
+            # 计算每一个batch的损失函数
+            loss = criterion(output, b_y)
+
+
+            # 对损失函数进行累加
+            val_loss += loss.item() * b_x.size(0)
+            # 如果预测正确，则准确度train_corrects加1
+            val_corrects += torch.sum(pre_lab == b_y.data)
+            # 当前用于验证的样本数量
+            val_num += b_x.size(0)
+
+        # 计算并保存每一次迭代的loss值和准确率
+        # 计算并保存训练集的loss值
+        train_loss_all.append(train_loss / train_num)
+        # 计算并保存训练集的准确率
+        train_acc_all.append(train_corrects.double().item() / train_num)
+
+        # 计算并保存验证集的loss值
+        val_loss_all.append(val_loss / val_num)
+        # 计算并保存验证集的准确率
+        val_acc_all.append(val_corrects.double().item() / val_num)
+
+        print("{} train loss:{:.4f} train acc: {:.4f}".format(epoch, train_loss_all[-1], train_acc_all[-1]))
+        print("{} val loss:{:.4f} val acc: {:.4f}".format(epoch, val_loss_all[-1], val_acc_all[-1]))
+
+        if val_acc_all[-1] &gt; best_acc:
+            # 保存当前最高准确度
+            best_acc = val_acc_all[-1]
+            # 保存当前最高准确度的模型参数
+            best_model_wts = copy.deepcopy(model.state_dict())
+
+        # 计算训练和验证的耗时
+        time_use = time.time() - since
+        print("训练和验证耗费的时间{:.0f}m{:.0f}s".format(time_use//60, time_use%60))
+
+    # 选择最优参数，保存最优参数的模型
+    model.load_state_dict(best_model_wts)
+    # torch.save(model.load_state_dict(best_model_wts), "C:/Users/86159/Desktop/LeNet/best_model.pth")
+    torch.save(best_model_wts, r"C:\Users\Administrator\Desktop\shb_model\model\new_model\mobilenetv2_140\bestmodel.pth")
+    train_process = pd.DataFrame(data={"epoch":range(num_epochs),
+                                       "train_loss_all":train_loss_all,
+                                       "val_loss_all":val_loss_all,
+                                       "train_acc_all":train_acc_all,
+                                       "val_acc_all":val_acc_all,})
+
+    return train_process
+
+
+def matplot_acc_loss(train_process):
+    # 显示每一次迭代后的训练集和验证集的损失函数和准确率
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_process['epoch'], train_process.train_loss_all, "ro-", label="Train loss")
+    plt.plot(train_process['epoch'], train_process.val_loss_all, "bs-", label="Val loss")
+    plt.legend()
+    plt.xlabel("epoch")
+    plt.ylabel("Loss")
+    plt.subplot(1, 2, 2)
+    plt.plot(train_process['epoch'], train_process.train_acc_all, "ro-", label="Train acc")
+    plt.plot(train_process['epoch'], train_process.val_acc_all, "bs-", label="Val acc")
+    plt.xlabel("epoch")
+    plt.ylabel("acc")
+    plt.legend()
+    plt.show()
+
+
+if __name__ == '__main__':
+    model = timm.create_model('mobilenetv2_140', pretrained=False, global_pool='avg')
+    from safetensors.torch import load_file
+    state_dict = load_file(r"C:\Users\Administrator\Desktop\shb_model\model\new_model\mobilenetv2_140\model.safetensors")
+    model.load_state_dict(state_dict)
+
+    # GoogLeNet = GoogLeNet(Inception)
+    # 加载数据集
+    train_data, val_data = train_val_data_process()
+    # 利用现有的模型进行模型的训练
+    train_process = train_model_process(model, train_data, val_data, num_epochs=15)
+    matplot_acc_loss(train_process)
